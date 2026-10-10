@@ -1,0 +1,4 @@
+source: /home/leon/Public/z_research/mkits/mkits
+mkits commit: unknown (source is not a git repository or git is unavailable)
+synced at: 2026-10-10T03:27:22+02:00
+files: structure.py, functions.py, database.py
