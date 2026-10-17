@@ -15,7 +15,7 @@ Usage:
     pyinstaller build.spec
 """
 
-from PyInstaller.utils.hooks import collect_all, collect_submodules, copy_metadata
+from PyInstaller.utils.hooks import collect_all
 
 datas = [("mconvert/resources", "mconvert/resources")]
 binaries = []
@@ -33,22 +33,6 @@ for package_name in ("spglib",):
     binaries += pkg_binaries
     hiddenimports += pkg_hiddenimports
 
-# PyOpenGL picks its platform backend (glx/egl/win32/...) at import time by
-# looking up entry points and importing the chosen module by name, which
-# PyInstaller's static scan cannot see: without these, the frozen app dies on
-# "import OpenGL" with "No module named 'OpenGL.platform.egl'".
-hiddenimports += collect_submodules("OpenGL")
-datas += copy_metadata("PyOpenGL")
-
-# pyqtgraph and PyOpenGL probe for many optional scientific packages. In an
-# environment that happens to have them installed (a shared conda env, say)
-# PyInstaller would bundle them and the build balloons to several GB. None of
-# them is used by mconvert, so keep them out regardless of the build env.
-excludes = [
-    "torch", "tensorflow", "jax", "scipy", "pandas", "matplotlib", "sklearn",
-    "numba", "h5py", "IPython", "notebook", "cupy", "PyQt5", "PyQt6", "PySide2",
-]
-
 a = Analysis(
     ["mconvert/__main__.py"],
     pathex=[],
@@ -58,7 +42,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=excludes,
+    excludes=[],
     noarchive=False,
 )
 pyz = PYZ(a.pure)

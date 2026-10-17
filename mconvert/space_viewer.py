@@ -1,4 +1,4 @@
-"""Real/reciprocal-space 3D viewer tab (PyQtGraph OpenGL).
+"""Real/reciprocal-space 3D viewer tab (OpenGL, or QPainter as a fallback; see viewport3d.py).
 
 Left/centre: a rotatable, zoomable 3D view. Right: real/reciprocal switch,
 display toggles and an info panel for the clicked atom or high-symmetry point.
@@ -9,10 +9,7 @@ import colorsys
 import math
 
 import numpy as np
-import pyqtgraph as pg
-import pyqtgraph.opengl as gl
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QButtonGroup, QCheckBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
     QMessageBox, QPushButton, QVBoxLayout, QWidget,
@@ -21,19 +18,21 @@ from PySide6.QtWidgets import (
 from mconvert import converter, formats
 from mconvert.dnd import single_local_file
 from mconvert.picking import pick_nearest
+from mconvert.viewport3d import Scene, create_viewport
 
 REAL, RECIPROCAL = "real", "reciprocal"
 
-_BACKGROUND = (255, 255, 255)
 _CELL_COLOR = (0.25, 0.25, 0.25, 1.0)
 _ZONE_COLOR = (0.15, 0.15, 0.15, 1.0)
 _PATH_COLOR = (0.85, 0.45, 0.0, 1.0)
 _KPOINT_COLOR = (0.85, 0.1, 0.55, 1.0)
 _HIGHLIGHT_COLOR = (1.0, 0.85, 0.0, 0.55)
 _AXIS_COLORS = ((0.85, 0.1, 0.1, 1.0), (0.1, 0.6, 0.1, 1.0), (0.1, 0.2, 0.85, 1.0))
+_LABEL_COLOR = (0.12, 0.12, 0.12, 1.0)
 
 _KPOINT_PIXEL_SIZE = 14
-_FOLDED_NOTE = "所选结构不是原胞：高对称点按原胞定义，因此落在所示（较小）布里渊区之外，对应能带折叠。"
+_FOLDED_NOTE = "所选结构不是原胞：高对称点按所给晶胞自身的晶格生成（与所示布里渊区一致），对应折叠后的能带。"
+_LARGE_NOTE = "原子数较多，未做对称性分析：高对称点按所给晶胞自身的晶格生成。"
 _PATH_2D_NOTE = "二维材料的高对称路径目前是近似表（仅区分 4 种二维布拉维格子）。"
 
 # CPK-style colours for common elements; anything else gets a stable colour
@@ -66,39 +65,8 @@ def _atom_diameter(atomic_mass):
     return 0.42 * mass ** (1.0 / 3.0)
 
 
-def _qmatrix_to_numpy(matrix):
-    """QMatrix4x4 exposes its data column-major."""
-    return np.array(matrix.data(), dtype=float).reshape(4, 4).T
-
-
 def _format_vector(values, digits=4):
     return "(" + ", ".join("%.*f" % (digits, v) for v in values) + ")"
-
-
-class PickableGLView(gl.GLViewWidget):
-    """GLViewWidget that also reports clicks (press and release without
-    dragging) so a drag still rotates the view instead of selecting."""
-
-    clicked = Signal(float, float)
-
-    CLICK_TOLERANCE_PX = 4
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._press_position = None
-
-    def mousePressEvent(self, event):
-        self._press_position = event.position()
-        super().mousePressEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        super().mouseReleaseEvent(event)
-        if event.button() != Qt.LeftButton or self._press_position is None:
-            return
-        moved = event.position() - self._press_position
-        if abs(moved.x()) <= self.CLICK_TOLERANCE_PX and abs(moved.y()) <= self.CLICK_TOLERANCE_PX:
-            self.clicked.emit(event.position().x(), event.position().y())
-        self._press_position = None
 
 
 class SpaceViewerTab(QWidget):
@@ -110,7 +78,7 @@ class SpaceViewerTab(QWidget):
         self._real_scene = None
         self._reciprocal_scene = None
         self._mode = REAL
-        self._highlight = None
+        self._draw = None
         self.selected_index = None
         self._pick_points = np.zeros((0, 3))
         self._pick_radii = np.zeros(0)
@@ -124,8 +92,7 @@ class SpaceViewerTab(QWidget):
     def _build_ui(self):
         layout = QHBoxLayout(self)
 
-        self.view = PickableGLView()
-        self.view.setBackgroundColor(_BACKGROUND)
+        self.view = create_viewport()
         self.view.clicked.connect(self._on_view_clicked)
         layout.addWidget(self.view, stretch=1)
 
@@ -262,8 +229,10 @@ class SpaceViewerTab(QWidget):
     def _update_note(self):
         notes = []
         if self._mode == RECIPROCAL and self._reciprocal_scene is not None:
-            if self._reciprocal_scene.points_outside_zone:
+            if self._reciprocal_scene.non_primitive_cell:
                 notes.append(_FOLDED_NOTE)
+            if self._reciprocal_scene.symmetry_skipped:
+                notes.append(_LARGE_NOTE)
             if self._reciprocal_scene.is_2d:
                 notes.append(_PATH_2D_NOTE)
         self.note_label.setText("\n".join(notes))
@@ -273,44 +242,30 @@ class SpaceViewerTab(QWidget):
     # scene building
     # ------------------------------------------------------------------ #
     def _rebuild_scene(self, *_):
-        self.view.clear()
-        self._highlight = None
+        self._draw = None
         self._pick_points = np.zeros((0, 3))
         self._pick_radii = np.zeros(0)
         self._pick_payload = []
         if self._real_scene is None:
+            self.view.set_scene(None)
             return
+        self._draw = Scene()
         if self._mode == REAL:
             self._build_real_scene()
         else:
             self._build_reciprocal_scene()
+        self.view.set_scene(self._draw)
         self._clear_selection()
-
-    def _add_segments(self, segments, color, width=1.5):
-        points = np.asarray(segments, dtype=float).reshape(-1, 3)
-        self.view.addItem(gl.GLLinePlotItem(
-            pos=points, color=color, width=width, mode="lines", antialias=True,
-            glOptions="translucent",
-        ))
-
-    def _add_label(self, position, text, color):
-        # "translucent", not the item default "additive": additive blending
-        # adds the text colour onto the background, so dark text on this
-        # white background would come out invisible.
-        self.view.addItem(gl.GLTextItem(
-            pos=position, text=text, color=color, font=QFont("Helvetica", 12, QFont.Bold),
-            glOptions="translucent",
-        ))
 
     def _add_axes(self, vectors, names):
         for vector, name, color in zip(vectors, names, _AXIS_COLORS):
-            self._add_segments([[0, 0, 0], vector], color, width=3.0)
-            self._add_label(np.asarray(vector) * 1.05, name, pg.mkColor([int(c * 255) for c in color]))
+            self._draw.add_segments([[[0, 0, 0], vector]], color, width=3.0)
+            self._draw.add_label(np.asarray(vector) * 1.05, name, color)
 
     def _build_real_scene(self):
         scene = self._real_scene
         if self.cell_checkbox.isChecked():
-            self._add_segments(scene.cell_edges, _CELL_COLOR)
+            self._draw.add_segments(scene.cell_edges, _CELL_COLOR)
         if self.axes_checkbox.isChecked():
             self._add_axes(scene.lattice, ("a", "b", "c"))
 
@@ -318,9 +273,7 @@ class SpaceViewerTab(QWidget):
             positions = np.array([atom.cart for atom in scene.atoms])
             diameters = np.array([_atom_diameter(atom.atomic_mass) for atom in scene.atoms])
             colors = np.array([_atom_color(atom.symbol, atom.atomic_number) for atom in scene.atoms])
-            self.view.addItem(gl.GLScatterPlotItem(
-                pos=positions, size=diameters, color=colors, pxMode=False, glOptions="opaque",
-            ))
+            self._draw.add_spheres(positions, diameters / 2.0, colors)
             self._pick_points = positions
             self._pick_radii = diameters / 2.0
             self._pick_payload = list(scene.atoms)
@@ -328,7 +281,7 @@ class SpaceViewerTab(QWidget):
     def _build_reciprocal_scene(self):
         scene = self._reciprocal_scene
         if self.cell_checkbox.isChecked():
-            self._add_segments(scene.zone_edges, _ZONE_COLOR)
+            self._draw.add_segments(scene.zone_edges, _ZONE_COLOR)
         if self.axes_checkbox.isChecked():
             self._add_axes(scene.rec_vectors[:2] if scene.is_2d else scene.rec_vectors,
                            ("b1", "b2") if scene.is_2d else ("b1", "b2", "b3"))
@@ -340,17 +293,14 @@ class SpaceViewerTab(QWidget):
                 for start, end in zip(path[:-1], path[1:]):
                     segments.append([by_key[start].cart, by_key[end].cart])
             if segments:
-                self._add_segments(segments, _PATH_COLOR, width=2.0)
+                self._draw.add_segments(segments, _PATH_COLOR, width=2.0)
 
         if scene.kpoints:
             positions = np.array([point.cart for point in scene.kpoints])
-            self.view.addItem(gl.GLScatterPlotItem(
-                pos=positions, size=_KPOINT_PIXEL_SIZE, color=_KPOINT_COLOR, pxMode=True,
-                glOptions="opaque",
-            ))
+            self._draw.add_markers(positions, _KPOINT_PIXEL_SIZE, _KPOINT_COLOR)
+            offset = self._scene_extent() * 0.02
             for point in scene.kpoints:
-                self._add_label(np.asarray(point.cart) + self._scene_extent() * 0.02,
-                                point.label, pg.mkColor(30, 30, 30))
+                self._draw.add_label(np.asarray(point.cart) + offset, point.label, _LABEL_COLOR)
             self._pick_points = positions
             self._pick_radii = np.zeros(len(positions))
             self._pick_payload = list(scene.kpoints)
@@ -377,10 +327,7 @@ class SpaceViewerTab(QWidget):
         if self._real_scene is None:
             return
         low, high = self._scene_bounds()
-        center = (low + high) / 2.0
-        extent = float(np.linalg.norm(high - low))
-        self.view.opts["center"] = pg.Vector(*center)
-        self.view.setCameraPosition(distance=max(extent, 1e-3) * 1.4, elevation=22, azimuth=-60)
+        self.view.fit_camera(low, high)
 
     # ------------------------------------------------------------------ #
     # picking / info panel
@@ -400,9 +347,7 @@ class SpaceViewerTab(QWidget):
 
     def view_matrices(self):
         """The view and projection matrices of the current camera, as 4x4 numpy arrays."""
-        viewport = self.view.getViewport()
-        return (_qmatrix_to_numpy(self.view.viewMatrix()),
-                _qmatrix_to_numpy(self.view.projectionMatrix(viewport, viewport)))
+        return self.view.view_matrices()
 
     def select(self, index):
         """Select the atom (real space) or high-symmetry point (reciprocal) at index."""
@@ -414,31 +359,22 @@ class SpaceViewerTab(QWidget):
                     "未知" if math.isnan(item.atomic_mass) else "%.4f amu" % item.atomic_mass,
                     _format_vector(item.frac), _format_vector(item.cart),
                 ))
-            size, color = _atom_diameter(item.atomic_mass) * 1.6, _HIGHLIGHT_COLOR
-            pixel_mode = False
+            halo = (self._pick_points[index], _atom_diameter(item.atomic_mass) * 0.8, None, _HIGHLIGHT_COLOR)
         else:
             self.info_label.setText(
                 "高对称点：%s\n分数坐标 (b1, b2, b3)：%s\n笛卡尔坐标 (1/Å)：%s" % (
                     item.label, _format_vector(item.frac), _format_vector(item.cart),
                 ))
-            size, color = _KPOINT_PIXEL_SIZE * 1.9, _HIGHLIGHT_COLOR
-            pixel_mode = True
+            halo = (self._pick_points[index], None, _KPOINT_PIXEL_SIZE * 1.9, _HIGHLIGHT_COLOR)
 
-        self._remove_highlight()
-        self._highlight = gl.GLScatterPlotItem(
-            pos=np.array([self._pick_points[index]]), size=size, color=color,
-            pxMode=pixel_mode, glOptions="translucent",
-        )
-        self.view.addItem(self._highlight)
+        self._draw.highlight = halo
+        self.view.update()
         self.selected_index = index
 
-    def _remove_highlight(self):
-        if self._highlight is not None:
-            self.view.removeItem(self._highlight)
-            self._highlight = None
-
     def _clear_selection(self):
-        self._remove_highlight()
+        if self._draw is not None:
+            self._draw.highlight = None
+            self.view.update()
         self.selected_index = None
         if self._real_scene is None:
             self.info_label.setText("")

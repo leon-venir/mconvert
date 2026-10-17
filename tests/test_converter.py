@@ -10,6 +10,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from mconvert import converter
+from mconvert.brillouin import points_outside_zone
 
 FIXTURE_POSCAR = (
     Path(__file__).resolve().parent.parent.parent
@@ -125,7 +126,7 @@ class TestSceneData(unittest.TestCase):
         corners = scene.zone_edges.reshape(-1, 3)
         self.assertLess(np.min(np.linalg.norm(corners - np.array(k_point.cart), axis=1)), 1e-3)
 
-    def test_conventional_cell_is_flagged_as_having_points_outside_its_zone(self):
+    def test_conventional_cell_gets_the_path_of_its_own_lattice(self):
         conventional = """Si conventional
 5.43
 1 0 0
@@ -143,11 +144,20 @@ Direct
 0.75 0.25 0.75
 0.25 0.75 0.75
 """
-        folded = converter.get_reciprocal_scene(self._load(conventional))
-        self.assertEqual(folded.lattice_type, "FCC")
-        self.assertTrue(folded.points_outside_zone)
+        scene = converter.get_reciprocal_scene(self._load(conventional))
+        # the 8-atom cell is a simple-cubic lattice: its own zone is a cube and
+        # the points are the cube's, not the fcc primitive cell's
+        self.assertTrue(scene.non_primitive_cell)
+        self.assertEqual(scene.lattice_type, "CUB")
+        self.assertEqual(len(scene.zone_edges), 12)
+        self.assertEqual({k.key for k in scene.kpoints}, {"GAMMA", "X", "M", "R"})
+        self.assertFalse(points_outside_zone([k.cart for k in scene.kpoints], scene.rec_vectors).any())
+        np.testing.assert_allclose(
+            np.linalg.norm(next(k for k in scene.kpoints if k.key == "X").cart), np.pi / 5.43)
+
         primitive = converter.get_reciprocal_scene(self._load(FCC_SI_POSCAR))
-        self.assertFalse(primitive.points_outside_zone)
+        self.assertFalse(primitive.non_primitive_cell)
+        self.assertEqual(primitive.lattice_type, "FCC")
 
     def test_high_symmetry_points_lie_inside_the_zone_for_every_bravais_variant(self):
         # one standard primitive cell per Setyawan-Curtarolo variant, built
@@ -190,7 +200,24 @@ Direct
             scene = converter.get_reciprocal_scene(
                 self._load("t\n1.0\n%s\nC\n1\nDirect\n0 0 0\n" % rows))
             self.assertEqual(scene.lattice_type, expected)
-            self.assertFalse(scene.points_outside_zone, expected)
+            self.assertFalse(scene.non_primitive_cell, expected)
+
+    def test_very_large_structures_skip_the_symmetry_analysis(self):
+        loaded = self._load(FCC_SI_POSCAR)
+        saved = converter.SYMMETRY_ATOM_LIMIT
+        converter.SYMMETRY_ATOM_LIMIT = 1
+        try:
+            scene = converter.get_reciprocal_scene(loaded)
+        finally:
+            converter.SYMMETRY_ATOM_LIMIT = saved
+        normal = converter.get_reciprocal_scene(loaded)
+        self.assertTrue(scene.symmetry_skipped)
+        self.assertFalse(normal.symmetry_skipped)
+        # a primitive cell: both routes agree
+        self.assertEqual(scene.lattice_type, normal.lattice_type)
+        self.assertEqual({k.key for k in scene.kpoints}, {k.key for k in normal.kpoints})
+        np.testing.assert_allclose(scene.rec_vectors, normal.rec_vectors, atol=1e-9)
+        self.assertEqual(len(scene.zone_edges), len(normal.zone_edges))
 
     def test_spelled_out_greek_labels_are_shown_as_greek_letters(self):
         tio2 = [[-1.5, 1.5, 2.5], [1.5, -1.5, 2.5], [1.5, 1.5, -2.5]]   # BCT2 has SIGMA and SIGMA1

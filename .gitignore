@@ -3,6 +3,8 @@ __pycache__/
 .venv/
 *.egg-info/
 
+design.md
+
 # PyInstaller
 build/
 dist/

@@ -8,6 +8,7 @@ different backend is ever swapped in.
 """
 
 import os
+import tempfile
 from dataclasses import dataclass
 from typing import Tuple
 
@@ -139,6 +140,11 @@ _CELL_EDGE_INDICES = tuple(
 
 _KPOINT_DISPLAY_LABELS = {"GAMMA": "\u0393", "SIGMA": "\u03a3", "SIGMA1": "\u03a31"}
 
+# Above this many atoms the symmetry analysis behind the high-symmetry points
+# is skipped: spglib's cost grows roughly with the square of the atom count
+# (about 15 s for 27000 atoms) and it holds the GIL, so it would freeze the GUI.
+SYMMETRY_ATOM_LIMIT = 3000
+
 
 @dataclass(frozen=True)
 class AtomInfo:
@@ -174,9 +180,11 @@ class ReciprocalScene:
     kpath_segments: Tuple[Tuple[str, ...], ...]   # sequences of KPointInfo.key
     lattice_type: str
     is_2d: bool
-    points_outside_zone: bool       # True when the structure is not a primitive cell: its
-                                    # high-symmetry points are those of the primitive cell
-                                    # and lie outside this (smaller) cell's zone
+    non_primitive_cell: bool        # True when the structure is not a primitive cell: the
+                                    # points were generated from the cell's own lattice,
+                                    # not from the crystal's primitive cell
+    symmetry_skipped: bool = False  # True for very large structures: no symmetry analysis was
+                                    # done, the points come from the cell's own lattice
 
 
 def get_real_space_scene(loaded: LoadedStructure) -> RealSpaceScene:
@@ -200,39 +208,79 @@ def get_real_space_scene(loaded: LoadedStructure) -> RealSpaceScene:
     return RealSpaceScene(atoms=tuple(atoms), lattice=lattice, cell_edges=cell_edges)
 
 
+def _kpoint_infos(path, rec_vectors):
+    infos = []
+    for key, frac in path.kpath_points.items():
+        frac = np.array(frac, dtype=float)
+        cart = frac @ rec_vectors
+        infos.append(KPointInfo(
+            label=_KPOINT_DISPLAY_LABELS.get(key, key), key=key,
+            frac=tuple(float(v) for v in frac), cart=tuple(float(v) for v in cart),
+        ))
+    return infos
+
+
+def _lattice_only_path(engine_struct, is_2d):
+    """The k-path of a cell's own lattice: seekpath of a one-atom cell with the
+    same lattice vectors, i.e. the cell treated as primitive."""
+    rows = "\n".join(" ".join("%.12f" % v for v in vector) for vector in engine_struct.lattice9)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        poscar = os.path.join(tmpdir, "POSCAR")
+        with open(poscar, "w") as f:
+            f.write("lattice only\n1.0\n%s\nH\n1\nDirect\n0 0 0\n" % rows)
+        return _EngineSeekpath(poscar, is2d=is_2d)
+
+
 def get_reciprocal_scene(loaded: LoadedStructure) -> ReciprocalScene:
     """
     Reciprocal basis, first Brillouin zone and high-symmetry points.
 
-    3D high-symmetry points follow the Setyawan-Curtarolo convention and are
-    expressed in this structure's own reciprocal basis (see the engine's
-    seekpath docstring); for a non-primitive cell they are the primitive
-    cell's points seen through the smaller zone, flagged by
-    ReciprocalScene.points_outside_zone. 2D paths are still a first
+    3D high-symmetry points follow the Setyawan-Curtarolo convention, expressed
+    in this structure's own reciprocal basis (see the engine's seekpath
+    docstring). The engine gives the points of the crystal's *primitive* cell;
+    for a non-primitive input cell (eg the 8-atom conventional Si cell) those
+    fall outside the smaller zone drawn for the cell. In that case the path is
+    regenerated from the cell's own lattice instead, so the points and the
+    zone describe the same cell (bands of that cell are the folded ones), and
+    ReciprocalScene.non_primitive_cell is set. Structures above
+    SYMMETRY_ATOM_LIMIT atoms skip the symmetry analysis altogether and use the
+    cell's own lattice (symmetry_skipped). 2D paths are still a first
     approximation.
     """
+    symmetry_skipped = loaded.summary.total_atoms > SYMMETRY_ATOM_LIMIT
     try:
+        if symmetry_skipped:
+            is_2d = bool(loaded._engine_struct.is_2d(2.0, 12.0))   # the engine's default thresholds
+            path = _lattice_only_path(loaded._engine_struct, is_2d)
+            rec_vectors = np.array(path.get_rec_basis(with_2pi=True), dtype=float)
+            return ReciprocalScene(
+                rec_vectors=rec_vectors,
+                zone_edges=brillouin_zone_edges(rec_vectors, is_2d=is_2d),
+                kpoints=tuple(_kpoint_infos(path, rec_vectors)),
+                kpath_segments=tuple(tuple(segment) for segment in path.kpath_segments),
+                lattice_type=path.lattice_type,
+                is_2d=is_2d,
+                non_primitive_cell=False,
+                symmetry_skipped=True,
+            )
         path = _EngineSeekpath(loaded.path)
+        rec_vectors = np.array(path.get_rec_basis(with_2pi=True), dtype=float)
+        kpoints = _kpoint_infos(path, rec_vectors)
+
+        is_2d = bool(path.is2d)
+        # The engine classifies the lattice within spglib's symprec, so a slightly
+        # distorted cell (a relaxed structure, a rounded POSCAR) still gets the
+        # ideal-lattice points, which can poke a hair outside its zone. A
+        # non-primitive cell overshoots by tens of percent of |b|, so a 2 %
+        # margin separates the two.
+        outside = points_outside_zone([k.cart for k in kpoints], rec_vectors, is_2d=is_2d, tol=0.02)
+        non_primitive = bool(np.any(outside))
+        if non_primitive:
+            path = _lattice_only_path(loaded._engine_struct, is_2d)
+            kpoints = _kpoint_infos(path, rec_vectors)
     except MkitsError as err:
         raise ConversionError(str(err)) from err
 
-    rec_vectors = np.array(path.get_rec_basis(with_2pi=True), dtype=float)
-    kpoints = []
-    for key, frac in path.kpath_points.items():
-        frac = np.array(frac, dtype=float)
-        cart = frac @ rec_vectors
-        kpoints.append(KPointInfo(
-            label=_KPOINT_DISPLAY_LABELS.get(key, key), key=key,
-            frac=tuple(float(v) for v in frac), cart=tuple(float(v) for v in cart),
-        ))
-
-    is_2d = bool(path.is2d)
-    # The engine classifies the lattice within spglib's symprec, so a slightly
-    # distorted cell (a relaxed structure, a rounded POSCAR) still gets the
-    # ideal-lattice points, which can poke a hair outside its zone. Genuine
-    # folding from a non-primitive cell overshoots by tens of percent of |b|,
-    # so a 2 % margin separates the two.
-    outside = points_outside_zone([k.cart for k in kpoints], rec_vectors, is_2d=is_2d, tol=0.02)
     return ReciprocalScene(
         rec_vectors=rec_vectors,
         zone_edges=brillouin_zone_edges(rec_vectors, is_2d=is_2d),
@@ -240,5 +288,5 @@ def get_reciprocal_scene(loaded: LoadedStructure) -> ReciprocalScene:
         kpath_segments=tuple(tuple(segment) for segment in path.kpath_segments),
         lattice_type=path.lattice_type,
         is_2d=is_2d,
-        points_outside_zone=bool(np.any(outside)),
+        non_primitive_cell=non_primitive,
     )
