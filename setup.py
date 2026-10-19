@@ -2,7 +2,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="mconvert",
-    version="0.1.0",
+    version="0.2.0",
     description="GUI structure-format converter built on mkits' structure engine",
     packages=find_packages(include=["mconvert", "mconvert.*"]),
     package_data={"mconvert": ["resources/*"]},
